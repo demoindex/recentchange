@@ -370,6 +370,28 @@ function ensurePlaceholders(){
 
 window.addEventListener("resize",ensurePlaceholders);
 
+
+function isCeMexicoPoison(edit, summary){
+ const wiki=String(edit?.wiki||"").toLowerCase();
+ if(wiki!=="cewiki") return false;
+
+ const text=[
+  edit?.title,
+  edit?.comment,
+  summary?.title,
+  summary?.description,
+  summary?.extract,
+  summary?.thumbnail?.source,
+  summary?.originalimage?.source
+ ].filter(Boolean).join(" ").toLowerCase();
+
+ return text.includes("mexico") ||
+        text.includes("мексика") ||
+        text.includes("inegi") ||
+        text.includes("mexique") ||
+        text.includes("méxico");
+}
+
 async function addTile(edit){
  const title=edit.title;
  const lang=edit.wiki.replace("wiki","");
@@ -378,6 +400,7 @@ async function addTile(edit){
  try{
   const r=await fetch(`https://${lang}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`);
   const d=await r.json();
+  if(isCeMexicoPoison(edit,d)) return;
   if(!d.thumbnail) return;
 
   const thumb=d.thumbnail.source;
