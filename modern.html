@@ -1,12 +1,12 @@
 
 <!DOCTYPE html>
+<!-- wikitiki modern v1.1.0 · clean production build -->
 
 <html>
 <head>
 <meta charset="utf-8"/>
 <title>wikitiki</title>
 <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
-<link href="https://fonts.googleapis.com/css2?family=Special+Elite&amp;display=swap" rel="stylesheet"/>
 <style>
 :root{
   --tileSize:clamp(90px,25vw,150px);
@@ -86,6 +86,11 @@ html,body{
 body.is-stopped .statusLight{
   background:#a00;
   border-color:#600;
+}
+
+body.is-reconnecting:not(.is-stopped) .statusLight{
+  background:#c58b00;
+  border-color:#7a5400;
 }
 
 .controlGroup{
@@ -247,258 +252,482 @@ button.stopped{
 </div>
 <div class="grid" id="grid"></div>
 <script>
-const grid=document.getElementById("grid");
-let source=null;
-let currentMode="square";
+"use strict";
 
+const BUILD_VERSION="1.1.0";
+const STREAM_URL="https://stream.wikimedia.org/v2/stream/recentchange";
+const MAX_PENDING_REQUESTS=24;
+const RECENT_PAGE_LIMIT=400;
+const RECENT_IMAGE_LIMIT=400;
+
+const BLOCKED_WIKIS=new Set([
+  "cewiki"
+]);
+
+const BLOCKED_DOMAINS=new Set([
+  "ce.wikipedia.org"
+]);
+
+const grid=document.getElementById("grid");
 const startBtn=document.getElementById("startBtn");
 const stopBtn=document.getElementById("stopBtn");
 const downloadBtn=document.getElementById("downloadBtn");
 
+let source=null;
+let currentMode="square";
+let downloadMode=false;
+let pendingRequests=0;
+
+const recentPages=new Set();
+const recentImages=new Set();
+
+function rememberBounded(set,key,limit){
+  if(set.has(key)) return false;
+  set.add(key);
+
+  while(set.size>limit){
+    set.delete(set.values().next().value);
+  }
+
+  return true;
+}
+
+function getEventDomain(edit){
+  const direct=String(
+    edit?.server_name||
+    edit?.domain||
+    edit?.meta?.domain||
+    ""
+  ).trim().toLowerCase();
+
+  if(direct) return direct;
+
+  const wiki=String(edit?.wiki||edit?.database||"").trim().toLowerCase();
+  const match=wiki.match(/^([a-z0-9_-]+)wiki$/);
+  return match ? `${match[1].replaceAll("_","-")}.wikipedia.org` : "";
+}
+
+function isBlockedChange(edit){
+  const wiki=String(edit?.wiki||edit?.database||"").toLowerCase();
+  const domain=getEventDomain(edit);
+
+  return BLOCKED_WIKIS.has(wiki) ||
+         BLOCKED_DOMAINS.has(domain);
+}
+
+function getWikipediaContext(edit){
+  if(isBlockedChange(edit)) return null;
+
+  const domain=getEventDomain(edit);
+  if(!domain.endsWith(".wikipedia.org")) return null;
+
+  return {
+    domain,
+    articleBase:`https://${domain}/wiki/`,
+    summaryBase:`https://${domain}/api/rest_v1/page/summary/`
+  };
+}
+
 function toggleFullscreen(){
- if(!document.fullscreenElement){
-  document.documentElement.requestFullscreen();
- }else{
-  document.exitFullscreen();
- }
+  if(!document.fullscreenElement){
+    document.documentElement.requestFullscreen().catch(error=>{
+      console.debug("[wikitiki] fullscreen unavailable",error);
+    });
+  }else{
+    document.exitFullscreen().catch(error=>{
+      console.debug("[wikitiki] fullscreen exit failed",error);
+    });
+  }
 }
 
 document.querySelectorAll(".ratioBtn").forEach(btn=>{
- btn.onclick=()=>{
-  document.querySelectorAll(".ratioBtn").forEach(b=>b.classList.remove("active"));
-  btn.classList.add("active");
-  currentMode=btn.dataset.ratio;
-  grid.className="grid "+(currentMode==="square"?"":currentMode);
-  ensurePlaceholders();
- };
+  btn.addEventListener("click",()=>{
+    document.querySelectorAll(".ratioBtn").forEach(item=>{
+      item.classList.remove("active");
+    });
+
+    btn.classList.add("active");
+    currentMode=btn.dataset.ratio;
+    grid.className=currentMode==="square" ? "grid" : `grid ${currentMode}`;
+
+    trimRealTiles();
+    ensurePlaceholders();
+  });
 });
 
 function getRatio(){
- if(currentMode==="avatar") return 1;
- const val=getComputedStyle(grid).getPropertyValue("--ratio").trim();
- const [w,h]=val.split("/").map(Number);
- return w/h;
+  if(currentMode==="avatar") return 1;
+
+  const raw=getComputedStyle(grid).getPropertyValue("--ratio").trim();
+  const [width,height]=raw.split("/").map(Number);
+  const ratio=width/height;
+
+  return Number.isFinite(ratio) && ratio>0 ? ratio : 1;
 }
 
-function clean(n){return n.replace(/[\\/:*?"<>|]/g,"_");}
+function cleanFilename(value){
+  const cleaned=String(value||"image")
+    .replace(/[\\/:*?"<>|]/g,"_")
+    .replace(/\s+/g," ")
+    .trim();
+
+  return cleaned||"image";
+}
+
+function triggerBlobDownload(blob,filename){
+  const objectUrl=URL.createObjectURL(blob);
+  const link=document.createElement("a");
+
+  link.href=objectUrl;
+  link.download=filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+
+  setTimeout(()=>URL.revokeObjectURL(objectUrl),1000);
+}
 
 function cropDownload(url,title){
- const img=new Image();
- img.crossOrigin="anonymous";
- img.src=url;
+  const image=new Image();
+  image.crossOrigin="anonymous";
+  image.decoding="async";
 
- img.onload=()=>{
-  const r=getRatio();
-  let sw=img.width,sh=img.height;
-  let cw=sw,ch=cw/r;
-  if(ch>sh){ch=sh;cw=ch*r;}
-  const sx=(sw-cw)/2;
-  const sy=(sh-ch)/2;
+  image.onload=()=>{
+    try{
+      const ratio=getRatio();
+      const sourceWidth=image.naturalWidth||image.width;
+      const sourceHeight=image.naturalHeight||image.height;
 
-  const size=1024;
-  let outW=size;
-  let outH=size/r;
+      let cropWidth=sourceWidth;
+      let cropHeight=cropWidth/ratio;
 
-  const c=document.createElement("canvas");
-  c.width=outW;c.height=outH;
-  const ctx=c.getContext("2d");
+      if(cropHeight>sourceHeight){
+        cropHeight=sourceHeight;
+        cropWidth=cropHeight*ratio;
+      }
 
-  if(currentMode==="avatar"){
-   ctx.beginPath();
-   ctx.arc(outW/2,outH/2,outW/2,0,Math.PI*2);
-   ctx.clip();
-  }
+      const sourceX=(sourceWidth-cropWidth)/2;
+      const sourceY=(sourceHeight-cropHeight)/2;
+      const outputWidth=1024;
+      const outputHeight=Math.round(outputWidth/ratio);
 
-  ctx.drawImage(img,sx,sy,cw,ch,0,0,outW,outH);
+      const canvas=document.createElement("canvas");
+      canvas.width=outputWidth;
+      canvas.height=outputHeight;
 
-  const a=document.createElement("a");
-  a.download=clean(title)+".jpg";
-  a.href=c.toDataURL("image/jpeg",0.92);
-  a.click();
- };
+      const context=canvas.getContext("2d");
+      if(!context) throw new Error("Canvas context unavailable.");
+
+      if(currentMode==="avatar"){
+        context.beginPath();
+        context.arc(
+          outputWidth/2,
+          outputHeight/2,
+          Math.min(outputWidth,outputHeight)/2,
+          0,
+          Math.PI*2
+        );
+        context.clip();
+      }
+
+      context.drawImage(
+        image,
+        sourceX,
+        sourceY,
+        cropWidth,
+        cropHeight,
+        0,
+        0,
+        outputWidth,
+        outputHeight
+      );
+
+      const isAvatar=currentMode==="avatar";
+      const mimeType=isAvatar ? "image/png" : "image/jpeg";
+      const extension=isAvatar ? "png" : "jpg";
+      const quality=isAvatar ? undefined : 0.92;
+
+      canvas.toBlob(blob=>{
+        if(!blob){
+          console.debug("[wikitiki] image export produced no data");
+          return;
+        }
+
+        triggerBlobDownload(
+          blob,
+          `${cleanFilename(title)}.${extension}`
+        );
+      },mimeType,quality);
+    }catch(error){
+      console.debug("[wikitiki] image export failed",error);
+    }
+  };
+
+  image.onerror=()=>{
+    console.debug("[wikitiki] image download failed",url);
+  };
+
+  image.src=url;
+}
+
+function updateStreamUi(running){
+  document.body.classList.toggle("is-stopped",!running);
+  if(!running) document.body.classList.remove("is-reconnecting");
+
+  startBtn.classList.toggle("running",running);
+  stopBtn.classList.toggle("stopped",!running);
 }
 
 function start(){
- if(source) return;
- source=new EventSource("https://stream.wikimedia.org/v2/stream/recentchange");
- source.onmessage=e=>{
-  const d=JSON.parse(e.data);
-  if(d.type==="edit" && d.namespace===0) addTile(d);
- };
- document.body.classList.remove("is-stopped");
- startBtn.classList.add("running");
- stopBtn.classList.remove("stopped");
+  if(source) return;
+
+  source=new EventSource(STREAM_URL);
+
+  source.onopen=()=>{
+    document.body.classList.remove("is-reconnecting");
+  };
+
+  source.onerror=()=>{
+    if(source) document.body.classList.add("is-reconnecting");
+  };
+
+  source.onmessage=event=>{
+    try{
+      const edit=JSON.parse(event.data);
+
+      if(isBlockedChange(edit)) return;
+      if(edit.type!=="edit" || edit.namespace!==0) return;
+
+      queueTile(edit);
+    }catch(error){
+      console.debug("[wikitiki] invalid stream event",error);
+    }
+  };
+
+  updateStreamUi(true);
 }
 
 function stop(){
- if(source){source.close();source=null;}
- document.body.classList.add("is-stopped");
- startBtn.classList.remove("running");
- stopBtn.classList.add("stopped");
+  if(source){
+    source.close();
+    source=null;
+  }
+
+  updateStreamUi(false);
+}
+
+function getGridCapacity(){
+  const styles=getComputedStyle(grid);
+  const columnGap=parseFloat(styles.columnGap)||0;
+  const rowGap=parseFloat(styles.rowGap)||0;
+  const template=styles.gridTemplateColumns.trim();
+
+  let columns=0;
+
+  if(template && template!=="none"){
+    columns=template.split(/\s+/).filter(Boolean).length;
+  }
+
+  if(!columns){
+    const tileSize=parseFloat(
+      getComputedStyle(document.documentElement)
+        .getPropertyValue("--tileSize")
+    )||150;
+
+    columns=Math.max(
+      1,
+      Math.floor((grid.clientWidth+columnGap)/(tileSize+columnGap))
+    );
+  }
+
+  const tileWidth=Math.max(
+    1,
+    (grid.clientWidth-columnGap*(columns-1))/columns
+  );
+
+  const tileHeight=tileWidth/getRatio();
+  const rows=Math.max(
+    1,
+    Math.ceil((grid.clientHeight+rowGap)/(tileHeight+rowGap))
+  );
+
+  return columns*rows;
+}
+
+function getRealTiles(){
+  return [...grid.children].filter(tile=>{
+    return !tile.classList.contains("placeholder");
+  });
+}
+
+function getPlaceholders(){
+  return [...grid.children].filter(tile=>{
+    return tile.classList.contains("placeholder");
+  });
+}
+
+function trimRealTiles(){
+  const capacity=getGridCapacity();
+  const realTiles=getRealTiles();
+
+  realTiles.slice(capacity).forEach(tile=>tile.remove());
 }
 
 function ensurePlaceholders(){
- const tileW=150;
- const ratio=getRatio();
- const tileH=tileW/ratio;
- const gridHeight=grid.clientHeight||(window.innerHeight-parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--chromeH")) || 58);
+  trimRealTiles();
 
- const cols=Math.ceil(window.innerWidth/tileW);
- const rows=Math.ceil(gridHeight/tileH);
- const needed=cols*rows;
+  const capacity=getGridCapacity();
+  const realCount=getRealTiles().length;
+  const placeholders=getPlaceholders();
+  const required=Math.max(0,capacity-realCount);
 
- const real=[...grid.children].filter(t=>!t.classList.contains("placeholder"));
- const placeholders=[...grid.children].filter(t=>t.classList.contains("placeholder"));
+  if(placeholders.length<required){
+    const fragment=document.createDocumentFragment();
 
- const totalNeeded=Math.max(0,needed-real.length);
-
- if(placeholders.length<totalNeeded){
-  for(let i=0;i<totalNeeded-placeholders.length;i++){
-   const t=document.createElement("div");
-   t.className="tile show placeholder";
-   grid.appendChild(t);
-  }
- }
-
- if(placeholders.length>totalNeeded){
-  let remove=placeholders.length-totalNeeded;
-  placeholders.reverse().forEach(p=>{
-   if(remove>0){p.remove();remove--;}
-  });
- }
-}
-
-window.addEventListener("resize",ensurePlaceholders);
-
-
-function isCeMexicoPoison(edit, summary){
- const wiki=String(edit?.wiki||"").toLowerCase();
- if(wiki!=="cewiki") return false;
-
- const text=[
-  edit?.title,
-  edit?.comment,
-  summary?.title,
-  summary?.description,
-  summary?.extract,
-  summary?.thumbnail?.source,
-  summary?.originalimage?.source
- ].filter(Boolean).join(" ").toLowerCase();
-
- return text.includes("mexico") ||
-        text.includes("мексика") ||
-        text.includes("inegi") ||
-        text.includes("mexique") ||
-        text.includes("méxico");
-}
-
-async function addTile(edit){
- const title=edit.title;
- const lang=edit.wiki.replace("wiki","");
- const url=`https://${lang}.wikipedia.org/wiki/${encodeURIComponent(title)}`;
-
- try{
-  const r=await fetch(`https://${lang}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`);
-  const d=await r.json();
-  if(isCeMexicoPoison(edit,d)) return;
-  if(!d.thumbnail) return;
-
-  const thumb=d.thumbnail.source;
-  const full=d.originalimage?.source||thumb;
-
-  const img=new Image();
-  img.src=thumb;
-
-  img.onload=()=>{
-   const tile=document.createElement("div");
-   tile.className="tile";
-   tile.style.backgroundImage=`url(${thumb})`;
-
-   tile.onclick=(e)=>{
-    if(e.altKey){
-     e.preventDefault();
-     cropDownload(full,title);
-    }else{
-     window.open(url,"_blank");
+    for(let index=placeholders.length;index<required;index++){
+      const tile=document.createElement("div");
+      tile.className="tile show placeholder";
+      fragment.appendChild(tile);
     }
-   };
 
-   tile.innerHTML=`<div class="info">${title}</div>`;
-   grid.prepend(tile);
-   requestAnimationFrame(()=>tile.classList.add("show"));
-
-   const ph=[...grid.children].find(t=>t.classList.contains("placeholder"));
-   if(ph) ph.remove();
-   ensurePlaceholders();
-  };
-
- }catch{}
-}
-
-ensurePlaceholders();
-start();
-
-
-// ===== KEYBOARD MODES =====
-let downloadMode = false;
-function toggleDownloadMode(){
-  downloadMode = !downloadMode;
-  if(downloadBtn) downloadBtn.classList.toggle("modeOn", downloadMode);
-}
-
-// SPACE = start/stop
-// F = fullscreen
-// R = cycle image formats
-// D = toggle download mode
-document.addEventListener("keydown", (e) => {
-  if (["INPUT","TEXTAREA"].includes(e.target.tagName)) return;
-
-  // SPACE
-  if (e.code === "Space") {
-    e.preventDefault();
-    if (source) stop(); else start();
+    grid.appendChild(fragment);
   }
 
-  // F = fullscreen
-  if (e.code === "KeyF") {
+  if(placeholders.length>required){
+    placeholders
+      .slice(required)
+      .forEach(tile=>tile.remove());
+  }
+}
+
+function waitForImage(url){
+  return new Promise((resolve,reject)=>{
+    const image=new Image();
+    image.decoding="async";
+
+    image.onload=()=>resolve(image);
+    image.onerror=()=>reject(new Error(`Image failed: ${url}`));
+    image.src=url;
+  });
+}
+
+async function addTile(edit,context){
+  const title=String(edit.title||"").trim();
+  if(!title) return;
+
+  const encodedTitle=encodeURIComponent(title);
+  const articleUrl=context.articleBase+encodedTitle;
+  const summaryUrl=context.summaryBase+encodedTitle;
+
+  const response=await fetch(summaryUrl,{
+    headers:{Accept:"application/json"}
+  });
+
+  if(!response.ok){
+    throw new Error(`Summary request failed: ${response.status}`);
+  }
+
+  const summary=await response.json();
+  const thumbnail=summary?.thumbnail?.source;
+
+  if(!thumbnail) return;
+  if(!rememberBounded(recentImages,thumbnail,RECENT_IMAGE_LIMIT)) return;
+
+  const fullImage=summary?.originalimage?.source||thumbnail;
+  await waitForImage(thumbnail);
+
+  const tile=document.createElement("div");
+  tile.className="tile";
+  tile.style.backgroundImage=`url("${thumbnail.replaceAll('"','\\"')}")`;
+
+  const info=document.createElement("div");
+  info.className="info";
+  info.textContent=title;
+  tile.appendChild(info);
+
+  tile.addEventListener("click",event=>{
+    if(downloadMode || event.altKey){
+      event.preventDefault();
+      cropDownload(fullImage,title);
+      return;
+    }
+
+    window.open(articleUrl,"_blank","noopener,noreferrer");
+  });
+
+  grid.prepend(tile);
+  requestAnimationFrame(()=>tile.classList.add("show"));
+
+  const placeholder=getPlaceholders()[0];
+  if(placeholder) placeholder.remove();
+
+  trimRealTiles();
+  ensurePlaceholders();
+}
+
+function queueTile(edit){
+  if(pendingRequests>=MAX_PENDING_REQUESTS) return;
+
+  const context=getWikipediaContext(edit);
+  if(!context) return;
+
+  const pageKey=`${context.domain}:${edit.title}`;
+  if(!rememberBounded(recentPages,pageKey,RECENT_PAGE_LIMIT)) return;
+
+  pendingRequests++;
+
+  addTile(edit,context)
+    .catch(error=>{
+      console.debug("[wikitiki] tile skipped",error);
+    })
+    .finally(()=>{
+      pendingRequests--;
+    });
+}
+
+function toggleDownloadMode(){
+  downloadMode=!downloadMode;
+  downloadBtn.classList.toggle("modeOn",downloadMode);
+}
+
+document.addEventListener("keydown",event=>{
+  if(["INPUT","TEXTAREA"].includes(event.target.tagName)) return;
+
+  if(event.code==="Space"){
+    event.preventDefault();
+    source ? stop() : start();
+  }
+
+  if(event.code==="KeyF"){
     toggleFullscreen();
   }
 
-  // R = cycle ratio
-  if (e.code === "KeyR") {
-    const btns = [...document.querySelectorAll(".ratioBtn")];
-    let idx = btns.findIndex(b=>b.classList.contains("active"));
-    idx = (idx+1) % btns.length;
-    btns[idx].click();
+  if(event.code==="KeyR"){
+    const buttons=[...document.querySelectorAll(".ratioBtn")];
+    let index=buttons.findIndex(button=>button.classList.contains("active"));
+    index=(index+1)%buttons.length;
+    buttons[index].click();
   }
 
-  // D = download mode toggle
-  if (e.code === "KeyD") {
+  if(event.code==="KeyD"){
     toggleDownloadMode();
   }
 });
 
-// patch tile click to respect downloadMode
-const origAddTile = addTile;
-addTile = async function(edit){
-  const beforeCount = grid.children.length;
-  await origAddTile(edit);
+if("ResizeObserver" in window){
+  new ResizeObserver(()=>{
+    trimRealTiles();
+    ensurePlaceholders();
+  }).observe(grid);
+}else{
+  window.addEventListener("resize",()=>{
+    trimRealTiles();
+    ensurePlaceholders();
+  });
+}
 
-  const tile = grid.firstChild;
-  if (!tile || !tile.classList.contains("tile")) return;
-
-  const oldClick = tile.onclick;
-  tile.onclick = (e)=>{
-    if (downloadMode){
-      e.preventDefault();
-      const title = tile.querySelector(".info")?.innerText || "image";
-      const bg = tile.style.backgroundImage.slice(5,-2);
-      cropDownload(bg,title);
-    } else {
-      oldClick(e);
-    }
-  };
-};
+ensurePlaceholders();
+start();
 </script>
 </body>
 </html>
